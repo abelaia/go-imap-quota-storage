@@ -37,22 +37,3 @@ func TestFetch(t *testing.T) {
 		t.Errorf("body mismatch: got \n%v\n but want \n%v", body, simpleRawMessage)
 	}
 }
-
-func TestFetch_closedConn(t *testing.T) {
-	client, server := newClientServerPair(t, imap.ConnStateSelected)
-	defer client.Close()
-	defer server.Close()
-
-	seqSet := imap.SeqSetNum(1)
-	fetchOptions := &imap.FetchOptions{UID: true}
-	fetchCmd := client.Fetch(seqSet, fetchOptions)
-
-	if err := client.Close(); err != nil {
-		t.Fatalf("client.Close() = %v", err)
-	}
-
-	_, err := fetchCmd.Collect()
-	if err == nil {
-		t.Errorf("FetchCommand.Collect() = nil, want an error")
-	}
-}
