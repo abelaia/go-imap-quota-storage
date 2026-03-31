@@ -1,6 +1,7 @@
 package imapmemserver
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"sort"
 	"strings"
@@ -12,10 +13,17 @@ import (
 
 const mailboxDelim rune = '/'
 
+type Quota struct {
+	MaxMessages        uint32 `json:"max_messages"`
+	MaxStorageBytes    uint64 `json:"max_storage_bytes"`
+	MaxMessagesPerHour uint32 `json:"max_messages_per_hour"`
+}
+
 type User struct {
 	username, password string
+	quotas             Quota
 
-	mutex           sync.Mutex
+	mutex           sync.RWMutex
 	mailboxes       map[string]*Mailbox
 	prevUidValidity uint32
 }
@@ -25,7 +33,24 @@ func NewUser(username, password string) *User {
 		username:  username,
 		password:  password,
 		mailboxes: make(map[string]*Mailbox),
+		quotas:    Quota{},
 	}
+}
+
+func NewUserUnlimited(username, password string) *User {
+	return NewUser(username, password)
+}
+
+func (u *User) SetQuotas(q Quota) {
+	u.mutex.Lock()
+	defer u.mutex.Unlock()
+	u.quotas = q
+}
+
+func (u *User) GetQuotas() Quota {
+	u.mutex.RLock()
+	defer u.mutex.RUnlock()
+	return u.quotas
 }
 
 func (u *User) Login(username, password string) error {
@@ -68,8 +93,6 @@ func (u *User) List(w *imapserver.ListWriter, ref string, patterns []string, opt
 	u.mutex.Lock()
 	defer u.mutex.Unlock()
 
-	// TODO: fail if ref doesn't exist
-
 	if len(patterns) == 0 {
 		return w.WriteList(&imap.ListData{
 			Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect},
@@ -110,15 +133,42 @@ func (u *User) List(w *imapserver.ListWriter, ref string, patterns []string, opt
 }
 
 func (u *User) Append(mailbox string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
-	mbox, err := u.mailbox(mailbox)
-	if err != nil {
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeTryCreate,
-			Text: "No such mailbox",
-		}
-	}
-	return mbox.appendLiteral(r, options)
+    mbox, err := u.mailbox(mailbox)
+    if err != nil {
+        return nil, err
+    }
+    
+    // First, read the message to get its size
+    var buf bytes.Buffer
+    if _, err := buf.ReadFrom(r); err != nil {
+        return nil, err
+    }
+    data := buf.Bytes()
+    
+    // Check quotas before appending
+    mbox.mutex.Lock()
+    currentCount := uint32(len(mbox.l))
+    currentSize := mbox.sizeLocked()
+    mbox.mutex.Unlock()
+    
+    if u.quotas.MaxMessages > 0 && currentCount >= u.quotas.MaxMessages {
+        return nil, &imap.Error{
+            Type: imap.StatusResponseTypeNo,
+            Code: "QUOTA_EXCEEDED",
+            Text: "Quota exceeded: maximum number of messages",
+        }
+    }
+    if u.quotas.MaxStorageBytes > 0 && uint64(currentSize)+uint64(len(data)) > u.quotas.MaxStorageBytes {
+        return nil, &imap.Error{
+            Type: imap.StatusResponseTypeNo,
+            Code: "QUOTA_EXCEEDED",
+            Text: "Quota exceeded: maximum storage size",
+        }
+    }
+    
+    // Create a new reader from the buffered data
+    dataReader := bytes.NewReader(data)
+    return mbox.appendLiteral(dataReader, options)
 }
 
 func (u *User) Create(name string, options *imap.CreateOptions) error {
@@ -135,8 +185,6 @@ func (u *User) Create(name string, options *imap.CreateOptions) error {
 		}
 	}
 
-	// UIDVALIDITY must change if a mailbox is deleted and re-created with the
-	// same name.
 	u.prevUidValidity++
 	u.mailboxes[name] = NewMailbox(name, u.prevUidValidity)
 	return nil

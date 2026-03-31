@@ -1,0 +1,10 @@
+{
+  "username": "alice",
+  "password_hash": "password",
+  "quotas": {
+    "max_messages": 100,
+    "max_storage_bytes": 10485760,
+    "max_messages_per_hour": 0
+  },
+  "mailboxes": {}
+}

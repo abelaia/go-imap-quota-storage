@@ -1,61 +1,80 @@
-// Package imapmemserver implements an in-memory IMAP server.
 package imapmemserver
 
 import (
-	"sync"
+    "sync"
 
-	"github.com/emersion/go-imap/v2/imapserver"
+    "github.com/emersion/go-imap/v2/imapserver"
+    "github.com/emersion/go-imap/v2/imapserver/imapmemserver/storage"
 )
 
 // Server is a server instance.
-//
-// A server contains a list of users.
 type Server struct {
-	mutex sync.Mutex
-	users map[string]*User
+    mutex   sync.Mutex
+    users   map[string]*User
+    storage storage.Storage
 }
 
-// New creates a new server.
+// New creates a new server with in-memory storage.
 func New() *Server {
-	return &Server{
-		users: make(map[string]*User),
-	}
+    return NewWithStorage(nil)
+}
+
+// NewWithStorage creates a new server with a custom storage backend.
+func NewWithStorage(st storage.Storage) *Server {
+    return &Server{
+        users:   make(map[string]*User),
+        storage: st,
+    }
 }
 
 // NewSession creates a new IMAP session.
 func (s *Server) NewSession() imapserver.Session {
-	return &serverSession{server: s}
+    return &serverSession{server: s}
 }
 
 func (s *Server) user(username string) *User {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return s.users[username]
+    s.mutex.Lock()
+    defer s.mutex.Unlock()
+    return s.users[username]
 }
 
-// AddUser adds a user to the server.
+// AddUser adds a user to the server and saves to storage.
 func (s *Server) AddUser(user *User) {
-	s.mutex.Lock()
-	s.users[user.username] = user
-	s.mutex.Unlock()
+    s.mutex.Lock()
+    defer s.mutex.Unlock()
+
+    // Save to storage if available
+    if s.storage != nil {
+        quotas := storage.Quota{
+            MaxMessages:        user.quotas.MaxMessages,
+            MaxStorageBytes:    user.quotas.MaxStorageBytes,
+            MaxMessagesPerHour: user.quotas.MaxMessagesPerHour,
+        }
+        // Create user in storage
+        if err := s.storage.CreateUser(user.username, user.password, quotas); err != nil {
+            // Log error but continue
+            println("Failed to save user to storage:", err.Error())
+        }
+    }
+
+    s.users[user.username] = user
 }
 
 type serverSession struct {
-	*UserSession // may be nil
-
-	server *Server // immutable
+    *UserSession // may be nil
+    server       *Server // immutable
 }
 
 var _ imapserver.Session = (*serverSession)(nil)
 
 func (sess *serverSession) Login(username, password string) error {
-	u := sess.server.user(username)
-	if u == nil {
-		return imapserver.ErrAuthFailed
-	}
-	if err := u.Login(username, password); err != nil {
-		return err
-	}
-	sess.UserSession = NewUserSession(u)
-	return nil
+    u := sess.server.user(username)
+    if u == nil {
+        return imapserver.ErrAuthFailed
+    }
+    if err := u.Login(username, password); err != nil {
+        return err
+    }
+    sess.UserSession = NewUserSession(u)
+    return nil
 }

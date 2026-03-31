@@ -10,10 +10,8 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 )
 
-// Mailbox is an in-memory mailbox.
-//
-// The same mailbox can be shared between multiple connections and multiple
-// users.
+//const mailboxDelim rune = '/'
+
 type Mailbox struct {
 	tracker     *imapserver.MailboxTracker
 	uidValidity uint32
@@ -26,12 +24,14 @@ type Mailbox struct {
 	uidNext    imap.UID
 }
 
-// NewMailbox creates a new mailbox.
 func NewMailbox(name string, uidValidity uint32) *Mailbox {
 	return &Mailbox{
 		tracker:     imapserver.NewMailboxTracker(0),
 		uidValidity: uidValidity,
 		name:        name,
+		subscribed:  false,
+		specialUse:  []imap.MailboxAttr{},
+		l:           []*message{},
 		uidNext:     1,
 	}
 }
@@ -63,7 +63,6 @@ func (mbox *Mailbox) list(options *imap.ListOptions) *imap.ListData {
 	return &data
 }
 
-// StatusData returns data for the STATUS command.
 func (mbox *Mailbox) StatusData(options *imap.StatusOptions) *imap.StatusData {
 	mbox.mutex.Lock()
 	defer mbox.mutex.Unlock()
@@ -128,13 +127,17 @@ func (mbox *Mailbox) appendLiteral(r imap.LiteralReader, options *imap.AppendOpt
 }
 
 func (mbox *Mailbox) copyMsg(msg *message) *imap.AppendData {
-	return mbox.appendBytes(msg.buf, &imap.AppendOptions{
+	opts := &imap.AppendOptions{
 		Time:  msg.t,
 		Flags: msg.flagList(),
-	})
+	}
+	return mbox.appendBytes(msg.buf, opts)
 }
 
 func (mbox *Mailbox) appendBytes(buf []byte, options *imap.AppendOptions) *imap.AppendData {
+	if options == nil {
+		options = &imap.AppendOptions{}
+	}
 	msg := &message{
 		flags: make(map[imap.Flag]struct{}),
 		buf:   buf,
@@ -171,7 +174,6 @@ func (mbox *Mailbox) rename(newName string) {
 	mbox.mutex.Unlock()
 }
 
-// SetSubscribed changes the subscription state of this mailbox.
 func (mbox *Mailbox) SetSubscribed(subscribed bool) {
 	mbox.mutex.Lock()
 	mbox.subscribed = subscribed
@@ -185,8 +187,6 @@ func (mbox *Mailbox) selectDataLocked() *imap.SelectData {
 	copy(permanentFlags, flags)
 	permanentFlags = append(permanentFlags, imap.FlagWildcard)
 
-	// TODO: skip if IMAP4rev1 is disabled by the server, or IMAP4rev2 is
-	// enabled by the client
 	firstUnseenSeqNum := mbox.firstUnseenSeqNumLocked()
 
 	return &imap.SelectData{
@@ -254,9 +254,6 @@ func (mbox *Mailbox) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) err
 }
 
 func (mbox *Mailbox) expungeLocked(expunged map[*message]struct{}) (seqNums []uint32) {
-	// TODO: optimize
-
-	// Iterate in reverse order, to keep sequence numbers consistent
 	var filtered []*message
 	for i := len(mbox.l) - 1; i >= 0; i-- {
 		msg := mbox.l[i]
@@ -269,20 +266,15 @@ func (mbox *Mailbox) expungeLocked(expunged map[*message]struct{}) (seqNums []ui
 		}
 	}
 
-	// Reverse filtered
 	for i := 0; i < len(filtered)/2; i++ {
 		j := len(filtered) - i - 1
 		filtered[i], filtered[j] = filtered[j], filtered[i]
 	}
 
 	mbox.l = filtered
-
 	return seqNums
 }
 
-// NewView creates a new view into this mailbox.
-//
-// Callers must call MailboxView.Close once they are done with the mailbox view.
 func (mbox *Mailbox) NewView() *MailboxView {
 	return &MailboxView{
 		Mailbox: mbox,
@@ -290,21 +282,12 @@ func (mbox *Mailbox) NewView() *MailboxView {
 	}
 }
 
-// A MailboxView is a view into a mailbox.
-//
-// Each view has its own queue of pending unilateral updates.
-//
-// Once the mailbox view is no longer used, Close must be called.
-//
-// Typically, a new MailboxView is created for each IMAP connection in the
-// selected state.
 type MailboxView struct {
 	*Mailbox
 	tracker   *imapserver.SessionTracker
 	searchRes imap.UIDSet
 }
 
-// Close releases the resources allocated for the mailbox view.
 func (mbox *MailboxView) Close() {
 	mbox.tracker.Close()
 }
@@ -353,7 +336,6 @@ func (mbox *MailboxView) Search(numKind imapserver.NumKind, criteria *imap.Searc
 			continue
 		}
 
-		// Always populate the UID set, since it may be saved later for SEARCHRES
 		uidSet.AddNum(msg.uid)
 
 		var num uint32
@@ -397,7 +379,7 @@ func (mbox *MailboxView) staticSearchCriteria(criteria *imap.SearchCriteria) {
 		switch numSet := numSet.(type) {
 		case imap.SeqSet:
 			seqNums = append(seqNums, numSet)
-		case imap.UIDSet: // can happen with SEARCHRES
+		case imap.UIDSet:
 			criteria.UID = append(criteria.UID, numSet)
 		}
 	}
@@ -443,8 +425,6 @@ func (mbox *MailboxView) forEach(numSet imap.NumSet, f func(seqNum uint32, msg *
 }
 
 func (mbox *MailboxView) forEachLocked(numSet imap.NumSet, f func(seqNum uint32, msg *message)) {
-	// TODO: optimize
-
 	numSet = mbox.staticNumSet(numSet)
 
 	for i, msg := range mbox.l {
@@ -466,12 +446,6 @@ func (mbox *MailboxView) forEachLocked(numSet imap.NumSet, f func(seqNum uint32,
 	}
 }
 
-// staticNumSet converts a dynamic sequence set into a static one.
-//
-// This is necessary to properly handle the special symbol "*", which
-// represents the maximum sequence number or UID in the mailbox.
-//
-// This function also handles the special SEARCHRES marker "$".
 func (mbox *MailboxView) staticNumSet(numSet imap.NumSet) imap.NumSet {
 	if imap.IsSearchRes(numSet) {
 		return mbox.searchRes
