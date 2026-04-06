@@ -4,6 +4,7 @@ import "time"
 
 type Storage interface {
 	// User management
+	ListUsers() ([]string, error)
 	GetUser(username string) (*UserData, error)
 	CreateUser(username, passwordHash string, quotas Quota) error
 	UpdateUserQuota(username string, quotas Quota) error

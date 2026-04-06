@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -175,6 +176,28 @@ func (s *FileStorage) RenameMailbox(username, oldName, newName string) error {
 	os.Rename(s.mailboxPath(username, oldName), s.mailboxPath(username, newName))
 	os.Rename(filepath.Dir(s.messagePath(username, oldName, 1)), filepath.Dir(s.messagePath(username, newName, 1)))
 	return nil
+}
+
+func (s *FileStorage) ListUsers() ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	dir := filepath.Join(s.baseDir, "users")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var users []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), ".json")
+		if name != "" {
+			users = append(users, name)
+		}
+	}
+	sort.Strings(users)
+	return users, nil
 }
 
 func (s *FileStorage) ListMailboxes(username string) ([]string, error) {

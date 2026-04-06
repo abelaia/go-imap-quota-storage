@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -23,9 +24,11 @@ type User struct {
 	username, password string
 	quotas             Quota
 
-	mutex           sync.RWMutex
-	mailboxes       map[string]*Mailbox
-	prevUidValidity uint32
+	mutex             sync.RWMutex
+	mailboxes         map[string]*Mailbox
+	messageTimestamps []time.Time
+	server            *Server
+	prevUidValidity   uint32
 }
 
 func NewUser(username, password string) *User {
@@ -133,42 +136,83 @@ func (u *User) List(w *imapserver.ListWriter, ref string, patterns []string, opt
 }
 
 func (u *User) Append(mailbox string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
-    mbox, err := u.mailbox(mailbox)
-    if err != nil {
-        return nil, err
-    }
-    
-    // First, read the message to get its size
-    var buf bytes.Buffer
-    if _, err := buf.ReadFrom(r); err != nil {
-        return nil, err
-    }
-    data := buf.Bytes()
-    
-    // Check quotas before appending
-    mbox.mutex.Lock()
-    currentCount := uint32(len(mbox.l))
-    currentSize := mbox.sizeLocked()
-    mbox.mutex.Unlock()
-    
-    if u.quotas.MaxMessages > 0 && currentCount >= u.quotas.MaxMessages {
-        return nil, &imap.Error{
-            Type: imap.StatusResponseTypeNo,
-            Code: "QUOTA_EXCEEDED",
-            Text: "Quota exceeded: maximum number of messages",
-        }
-    }
-    if u.quotas.MaxStorageBytes > 0 && uint64(currentSize)+uint64(len(data)) > u.quotas.MaxStorageBytes {
-        return nil, &imap.Error{
-            Type: imap.StatusResponseTypeNo,
-            Code: "QUOTA_EXCEEDED",
-            Text: "Quota exceeded: maximum storage size",
-        }
-    }
-    
-    // Create a new reader from the buffered data
-    dataReader := bytes.NewReader(data)
-    return mbox.appendLiteral(dataReader, options)
+	mbox, err := u.mailbox(mailbox)
+	if err != nil {
+		return nil, err
+	}
+
+	// First, read the message to get its size
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		return nil, err
+	}
+	data := buf.Bytes()
+
+	// Check per-hour quota
+	u.mutex.Lock()
+	oneHourAgo := time.Now().Add(-time.Hour)
+	recent := 0
+	for _, t := range u.messageTimestamps {
+		if t.After(oneHourAgo) {
+			recent++
+		}
+	}
+	if u.quotas.MaxMessagesPerHour > 0 && uint32(recent) >= u.quotas.MaxMessagesPerHour {
+		u.mutex.Unlock()
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: "QUOTA_EXCEEDED",
+			Text: "Quota exceeded: maximum messages per hour",
+		}
+	}
+	u.mutex.Unlock()
+
+	// Check quotas before appending
+	mbox.mutex.Lock()
+	currentCount := uint32(len(mbox.l))
+	currentSize := mbox.sizeLocked()
+	mbox.mutex.Unlock()
+
+	if u.quotas.MaxMessages > 0 && currentCount >= u.quotas.MaxMessages {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: "QUOTA_EXCEEDED",
+			Text: "Quota exceeded: maximum number of messages",
+		}
+	}
+	if u.quotas.MaxStorageBytes > 0 && uint64(currentSize)+uint64(len(data)) > u.quotas.MaxStorageBytes {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: "QUOTA_EXCEEDED",
+			Text: "Quota exceeded: maximum storage size",
+		}
+	}
+
+	// Create a new reader from the buffered data
+	dataReader := bytes.NewReader(data)
+	ad, err := mbox.appendLiteral(dataReader, options)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add timestamp
+	u.mutex.Lock()
+	u.messageTimestamps = append(u.messageTimestamps, time.Now())
+	u.mutex.Unlock()
+
+	// Save to storage
+	if u.server != nil && u.server.storage != nil {
+		flags := make([]string, len(options.Flags))
+		for i, f := range options.Flags {
+			flags[i] = string(f)
+		}
+		err := u.server.storage.AppendMessage(u.username, mailbox, uint32(ad.UID), data, flags, options.Time)
+		if err != nil {
+			println("Failed to append message to storage: ", err.Error())
+		}
+	}
+
+	return ad, nil
 }
 
 func (u *User) Create(name string, options *imap.CreateOptions) error {
@@ -187,6 +231,13 @@ func (u *User) Create(name string, options *imap.CreateOptions) error {
 
 	u.prevUidValidity++
 	u.mailboxes[name] = NewMailbox(name, u.prevUidValidity)
+
+	if u.server != nil && u.server.storage != nil {
+		err := u.server.storage.CreateMailbox(u.username, name, u.prevUidValidity)
+		if err != nil {
+			println("Failed to create mailbox in storage: ", err.Error())
+		}
+	}
 	return nil
 }
 
@@ -199,6 +250,13 @@ func (u *User) Delete(name string) error {
 	}
 
 	delete(u.mailboxes, name)
+
+	if u.server != nil && u.server.storage != nil {
+		err := u.server.storage.DeleteMailbox(u.username, name)
+		if err != nil {
+			println("Failed to delete mailbox in storage: ", err.Error())
+		}
+	}
 	return nil
 }
 
@@ -224,6 +282,13 @@ func (u *User) Rename(oldName, newName string, options *imap.RenameOptions) erro
 	mbox.rename(newName)
 	u.mailboxes[newName] = mbox
 	delete(u.mailboxes, oldName)
+
+	if u.server != nil && u.server.storage != nil {
+		err := u.server.storage.RenameMailbox(u.username, oldName, newName)
+		if err != nil {
+			println("Failed to rename mailbox in storage: ", err.Error())
+		}
+	}
 	return nil
 }
 

@@ -6,5 +6,7 @@
     "max_storage_bytes": 10485760,
     "max_messages_per_hour": 0
   },
-  "mailboxes": {}
+  "mailboxes": {
+    "INBOX": true
+  }
 }
